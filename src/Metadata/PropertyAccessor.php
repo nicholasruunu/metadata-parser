@@ -29,7 +29,7 @@ final class PropertyAccessor implements \JsonSerializable
 
     public function isDefined(): bool
     {
-        return $this->hasGetterMethod() || $this->hasGetterMethod();
+        return $this->hasGetterMethod() || $this->hasSetterMethod();
     }
 
     public function hasGetterMethod(): bool

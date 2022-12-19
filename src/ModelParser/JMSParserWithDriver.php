@@ -15,11 +15,12 @@ use Doctrine\Common\Annotations\AnnotationException;
 use Doctrine\Common\Annotations\Reader;
 use JMS\Serializer\Annotation\Accessor;
 use JMS\Serializer\Annotation\AccessorOrder;
-use JMS\Serializer\Annotation\AccessType;
 use JMS\Serializer\Annotation\Exclude;
 use JMS\Serializer\Annotation\ExclusionPolicy;
 use JMS\Serializer\Annotation\Groups;
 use JMS\Serializer\Annotation\PostDeserialize;
+use JMS\Serializer\Annotation\ReadOnly;
+use JMS\Serializer\Annotation\ReadOnlyProperty;
 use JMS\Serializer\Annotation\SerializedName;
 use JMS\Serializer\Annotation\Since;
 use JMS\Serializer\Annotation\Type;
@@ -31,7 +32,8 @@ use JMS\Serializer\Annotation\XmlList;
 use JMS\Serializer\Annotation\XmlMap;
 use JMS\Serializer\Annotation\XmlRoot;
 use JMS\Serializer\Annotation\XmlValue;
-use JMS\Serializer\Exception\InvalidMetadataException;
+use JMS\Serializer\Metadata\ClassMetadata;
+use JMS\Serializer\Metadata\Driver\AnnotationDriver;
 use JMS\Serializer\Metadata\Driver\AttributeDriver\AttributeReader;
 use JMS\Serializer\Type\Exception\SyntaxError;
 use Liip\MetadataParser\Exception\InvalidTypeException;
@@ -44,7 +46,7 @@ use Liip\MetadataParser\ModelParser\RawMetadata\PropertyVariationMetadata;
 use Liip\MetadataParser\ModelParser\RawMetadata\RawClassMetadata;
 use Liip\MetadataParser\TypeParser\JMSTypeParser;
 use Liip\MetadataParser\TypeParser\PhpTypeParser;
-use ReflectionClass;
+use Metadata\Driver\DriverInterface;
 
 /**
  * Parse JMSSerializer annotations.
@@ -53,7 +55,7 @@ use ReflectionClass;
  *
  * @internal
  */
-abstract class BaseJMSParser implements ModelParserInterface
+class JMSParserWithDriver implements ModelParserInterface
 {
     private const ACCESS_ORDER_CUSTOM = 'custom';
 
@@ -71,8 +73,9 @@ abstract class BaseJMSParser implements ModelParserInterface
      * @var JMSTypeParser
      */
     protected $jmsTypeParser;
+    private AnnotationDriver $driver;
 
-    public function __construct(Reader $annotationsReader)
+    public function __construct(AnnotationDriver $driver, Reader $annotationsReader)
     {
         if (PHP_VERSION_ID >= 80000 && class_exists(AttributeReader::class)) {
             $annotationsReader = new AttributeReader($annotationsReader);
@@ -81,6 +84,7 @@ abstract class BaseJMSParser implements ModelParserInterface
         $this->annotationsReader = $annotationsReader;
         $this->phpTypeParser = new PhpTypeParser();
         $this->jmsTypeParser = new JMSTypeParser();
+        $this->driver = $driver;
     }
 
     public function parse(RawClassMetadata $classMetadata): void
@@ -89,6 +93,13 @@ abstract class BaseJMSParser implements ModelParserInterface
             $reflClass = new \ReflectionClass($classMetadata->getClassName());
         } catch (\ReflectionException $e) {
             throw ParseException::classNotFound($classMetadata->getClassName(), $e);
+        }
+
+        /** @var ClassMetadata $jmsMetadata */
+        $jmsMetadata = $this->driver->loadMetadataForClass($reflClass);
+
+        foreach ($jmsMetadata->propertyMetadata as $property) {
+            dump($property);exit;
         }
 
         try {
@@ -203,18 +214,6 @@ abstract class BaseJMSParser implements ModelParserInterface
                     // skip these attributes, we don't do xml
                     break;
 
-                case $annotation instanceof AccessType:
-                    foreach ($classMetadata->getPropertyVariations() as $property) {
-                        if ($property->getAccessor()->isDefined()) {
-                            continue;
-                        }
-
-                        $property->setAccessor(
-                            $this->getMethodAccessorForProperty($reflClass, $property)
-                        );
-                    }
-                    break;
-
                 default:
                     if (0 === strncmp('JMS\Serializer\\', \get_class($annotation), \mb_strlen('JMS\Serializer\\'))) {
                         // if there are annotations we can safely ignore, we need to explicitly ignore them
@@ -253,7 +252,30 @@ abstract class BaseJMSParser implements ModelParserInterface
      *
      * @return bool whether $annotation was a readonly information
      */
-    abstract protected function parsePropertyAnnotationsReadOnly(object $annotation, PropertyVariationMetadata $property): bool;
+    protected function parsePropertyAnnotationsReadOnly(object $annotation, PropertyVariationMetadata $property): bool
+    {
+        if (PHP_VERSION_ID > 80100) {
+            if ($annotation instanceof ReadOnlyProperty) {
+                $property->setReadOnly($annotation->readOnly);
+
+                return true;
+            }
+
+            return false;
+        }
+
+        // ReadOnly is deprecated since JMS serializer 3.14.
+        // In older versions, ReadOnlyProperty does not exist and we need to explicitly check for ReadOnly until we mark this library as conflicting with jms serializer < 3.14
+        if ($annotation instanceof ReadOnlyProperty
+            || $annotation instanceof ReadOnly
+        ) {
+            $property->setReadOnly($annotation->readOnly);
+
+            return true;
+        }
+
+        return false;
+    }
 
     private function parsePropertyAnnotations(RawClassMetadata $classMetadata, PropertyVariationMetadata $property, array $annotations): void
     {
@@ -442,36 +464,4 @@ abstract class BaseJMSParser implements ModelParserInterface
 
         return $name;
     }
-
-    private function getMethodAccessorForProperty(ReflectionClass $class, PropertyVariationMetadata $property): PropertyAccessor
-    {
-        $propertyName = $property->getName();
-        $getter = null;
-        $setter = null;
-
-        if ($class->hasMethod($propertyName) && $class->getMethod($propertyName)->isPublic()) {
-            $getter = $propertyName;
-        } elseif ($class->hasMethod('get' . $propertyName) && $class->getMethod('get' . $propertyName)->isPublic()) {
-            $getter = 'get' . $propertyName;
-        } elseif ($class->hasMethod('is' . $propertyName) && $class->getMethod('is' . $propertyName)->isPublic()) {
-            $getter = 'is' . $propertyName;
-        } elseif ($class->hasMethod('has' . $propertyName) && $class->getMethod('has' . $propertyName)->isPublic()) {
-            $getter = 'has' . $propertyName;
-        }
-        if (
-            !$property->isReadOnly()
-            && $class->hasMethod('set' . $propertyName)
-            && $class->getMethod('set' . $propertyName)->isPublic()
-        ) {
-            $setter = 'set' . $propertyName;
-        }
-
-        return new PropertyAccessor($getter, $setter);
-    }
-}
-
-if (PHP_VERSION_ID > 80100) {
-    require 'JMSParser81.php';
-} else {
-    require 'JMSParserLegacy.php';
 }
